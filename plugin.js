@@ -1,39 +1,62 @@
-// bg-review-watch — status chip + nudge countdown for Hermes background self-improvement runs.
+// bg-review-watch — status chip + nudge countdown for Hermes background self-improvement runs,
+// plus a compaction chip that surfaces context compression (batch + micro) on the local model.
 //
 // Disk plugin (loaded uncompiled): only @hermes/plugin-sdk / react / react/jsx-runtime resolve.
 //
 // What it shows (status bar, right cluster):
-//   idle    → "review idle"   + fill bar: turns since last review / nudge interval
-//   running → "review running · 2m 14s" (pulsing dot, accent color)
-//   just done → "review done 3s ago" + the summary text in the tooltip
+//   review chip (always):
+//     idle    → "review idle"   + fill bar: turns since last review / nudge interval
+//     running → "review running · 2m 14s" (pulsing dot, accent color)
+//     just done → "review done 3s ago" + the summary text in the tooltip
+//   compaction chip (only while compacting or within 10 min of a finish):
+//     running → "compacting · 4m 12s" (pulsing dot, accent color)
+//     just done → "compact done 3m ago" / "compact failed 2m ago" (reduction or failure in tooltip)
 //
 // Data sources (all read-only, no Python backend, no gateway restart):
-//   - host.onEvent('review.summary')       → live completion + summary text
-//   - host.onEvent('message.start')        → turn ticks for the countdown
-//   - host.logs({ file:'agent', search:… }) → start/complete markers, 20s poll
-//   - host.request('config.get')           → nudge intervals (best-effort, defaults 10/15)
+//   - host.onEvent('review.summary')        → live review completion + summary text
+//   - host.onEvent('message.start')         → turn ticks for the review countdown
+//   - host.logs({ file:'agent', search:… }) → markers, 20s poll:
+//       'bg-review'            → review start/complete markers
+//       'context compression'  → batch compaction started/done/attempt-telemetry markers
+//       'Micro-compaction'     → per-turn micro-compact pass results
+//   - host.request('config.get')            → nudge intervals (best-effort, defaults 10/15)
 //
 // Detection model: at most one background review runs at a time (a new turn supersedes an
 // in-flight one, and superseded runs still log a `complete` line). So:
-//   running  <=>  latest "thread=bg-review:<pid>" start ts  >  latest complete/failed ts
+//   review running  <=>  latest "thread=bg-review:<pid>" start ts  >  latest complete/failed ts
 //
-// agent.log markers (verified 2026-09-23 against 17 historical runs):
-//   start:  "<ts> INFO run_agent: OpenAI client created … thread=bg-review:<pid> …"  (spawn only —
-//           the retired/closed teardown lines ALSO carry thread=bg-review:<pid> and arrive after
-//           done, so the "OpenAI client created" anchor is load-bearing: without it, start > done)
-//   done:   "<ts> INFO […] agent.background_review: Background review complete: thread=bg-review calls=… result=skill|none"
-//   fail:   "<ts> WARNING […] agent.background_review: Background memory/skill review failed: …"
+// Compaction runs one at a time too (the compressor serializes attempts on the session).
+// A batch attempt logs `context compression started:` at attempt start and exactly one
+// terminal line at attempt end: `context compression done:` (committed) and/or the
+// `context compression attempt telemetry:` JSON line (covers both committed and aborted,
+// carries failure_class + total_duration_ms). So:
+//   compaction running <=> latest start ts > latest terminal (done/telemetry) ts
+//
+// agent.log markers (verified 2026-09-27 against agent/conversation_compression.py:4011/4223/1498,
+// agent/turn_finalizer.py:302/304, and 10 historical attempts in agent.log 09-20..09-26):
+//   start:   "<ts> INFO agent.conversation_compression: context compression started: session=… messages=N tokens=~… model=… focus=…"
+//   done:    "<ts> INFO … context compression done: session=… messages=A->B rough_tokens=~… awaiting_real_usage=true"
+//   terminal:"<ts> INFO … context compression attempt telemetry: {"…","commit_status":"committed|aborted","failure_class":"stall_interrupted|…","total_duration_ms":…,…}"
+//   micro ok:   "<ts> INFO agent.turn_finalizer: Micro-compaction: A -> B messages"
+//   micro fail: "<ts> WARNING agent.turn_finalizer: Micro-compaction failed: <err>"
 
 import { host, STATUSBAR_AREAS, Tip } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
 import { useSyncExternalStore, useState, useEffect } from 'react'
 
-const POLL_MS = 20000 // log poll cadence (idle cost is one tiny server-side-filtered REST call)
+const POLL_MS = 20000 // log poll cadence (idle cost is a few tiny server-side-filtered REST calls)
 const RECENT_DONE_MS = 600000 // keep the "done Xs ago" label for 10 min, then plain idle
+const RECENT_COMP_MS = 600000 // keep the compaction chip 10 min after a finish
 
 const RE_START = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*OpenAI client created.*thread=bg-review:(\d+)/
 const RE_DONE = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*(Background review complete|Background memory\/skill review failed)(?:.*result=(\w+))?/
 const RE_TURN = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*Turn ended/
+
+const RE_COMP_START = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*context compression started: session=(\S+) messages=(\d+) tokens=~?([\d,]+)/
+const RE_COMP_DONE = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*context compression done: session=(\S+) messages=(\d+)->(\d+)/
+const RE_COMP_TEL = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*context compression attempt telemetry: (.*)$/
+const RE_MICRO_OK = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*Micro-compaction: (\d+) -> (\d+) messages/
+const RE_MICRO_FAIL = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*Micro-compaction failed: (.+)/
 
 function lineText(l) {
   return typeof l === 'string' ? l : (l && (l.line || l.message || l.text)) || ''
@@ -50,8 +73,13 @@ function ago(ms) {
   if (m < 60) return `${m}m ${s % 60}s`
   return `${Math.floor(m / 60)}h ${m % 60}m`
 }
+function fmtTokens(n) {
+  if (n == null) return '?'
+  if (n >= 1000) return `${Math.round(n / 1000)}K`
+  return String(n)
+}
 
-// ── plugin-global state (shared by the chip; module-scoped = survives chip re-mounts) ──
+// ── plugin-global state (shared by the chips; module-scoped = survives chip re-mounts) ──
 let state = {
   mode: 'idle', // 'idle' | 'running'
   startedAt: null,
@@ -62,10 +90,27 @@ let state = {
   memInterval: 10,
   skillInterval: 15,
   lastPoll: 0,
+  compact: {
+    mode: 'idle', // 'idle' | 'running'
+    startedAt: null,
+    startTokens: null,
+    endedAt: null,
+    committed: null, // true = committed, false = aborted, null = unknown
+    failure: null,
+    doneFrom: null,
+    doneTo: null,
+    lastMicroAt: null,
+    microDetail: null,
+    lastPoll: 0,
+  },
 }
 let subs = new Set()
 function set(patch) {
   state = { ...state, ...patch }
+  subs.forEach((f) => f())
+}
+function setCompact(patch) {
+  state = { ...state, compact: { ...state.compact, ...patch } }
   subs.forEach((f) => f())
 }
 
@@ -87,6 +132,70 @@ function collectReviewMarkers(lines) {
     }
   }
   return { start, done, result }
+}
+
+// Telemetry JSON fields (keys are sorted in the log line; match by key, not position)
+function parseCompactionTelemetry(json) {
+  const cs = /"commit_status"\s*:\s*"(\w+)"/.exec(json)
+  if (!cs) return null
+  const fc = /"failure_class"\s*:\s*"(\w+)"/.exec(json)
+  const dm = /"total_duration_ms"\s*:\s*(\d+)/.exec(json)
+  return {
+    committed: cs[1] === 'committed',
+    failure: cs[1] === 'aborted' ? (fc ? fc[1] : null) : null,
+    durationMs: dm ? +dm[1] : null,
+  }
+}
+
+function collectCompactionMarkers(lines) {
+  let start = null
+  let startTokens = null
+  let telTs = null
+  let tel = null // { committed, failure, durationMs } of the newest telemetry line
+  let doneTs = null
+  let doneFrom = null
+  let doneTo = null
+  for (const text of lines.map(lineText)) {
+    let m = RE_COMP_DONE.exec(text)
+    if (m) {
+      const t = ts(m[1])
+      if (t && (doneTs == null || t > doneTs)) { doneTs = t; doneFrom = +m[3]; doneTo = +m[4] }
+      continue
+    }
+    m = RE_COMP_TEL.exec(text)
+    if (m) {
+      const t = ts(m[1])
+      const parsed = parseCompactionTelemetry(m[2] || '')
+      if (t && parsed && (telTs == null || t > telTs)) { telTs = t; tel = parsed }
+      continue
+    }
+    m = RE_COMP_START.exec(text)
+    if (m) {
+      const t = ts(m[1])
+      if (t && (start == null || t > start)) { start = t; startTokens = m[4] ? +m[4].replace(/,/g, '') : null }
+    }
+  }
+  const endTs = Math.max(telTs || 0, doneTs || 0) || null
+  return { start, startTokens, end: endTs, tel, doneFrom, doneTo }
+}
+
+function collectMicroMarkers(lines) {
+  let at = null
+  let detail = null
+  for (const text of lines.map(lineText)) {
+    let m = RE_MICRO_OK.exec(text)
+    if (m) {
+      const t = ts(m[1])
+      if (t && (at == null || t > at)) { at = t; detail = `${m[2]} → ${m[3]} msgs` }
+      continue
+    }
+    m = RE_MICRO_FAIL.exec(text)
+    if (m) {
+      const t = ts(m[1])
+      if (t && (at == null || t > at)) { at = t; detail = `failed: ${m[2].slice(0, 80)}` }
+    }
+  }
+  return { at, detail }
 }
 
 async function reconcile() {
@@ -122,6 +231,50 @@ async function reconcile() {
   }
 }
 
+async function reconcileCompaction() {
+  const now = Date.now()
+  if (now - state.compact.lastPoll < 5000) return
+  state.compact.lastPoll = now
+  try {
+    // 3000-line window: a batch compaction can run 20+ min, and the log keeps
+    // accumulating unrelated lines while it runs — the start line must stay in view.
+    const c = await host.logs({ file: 'agent', lines: 3000, search: 'context compression' })
+    const clines = (c && (c.lines || c.data || c.logs)) || []
+    const { start, startTokens, end, tel, doneFrom, doneTo } = collectCompactionMarkers(clines)
+
+    const running = start != null && (end == null || start > end)
+
+    // newest terminal wins: telemetry covers both committed and aborted
+    let endedAt = null
+    let committed = null
+    let failure = null
+    if (end != null) {
+      endedAt = end
+      if (tel) { committed = tel.committed; failure = tel.failure }
+      else committed = true // only a `done` line (committed path) was in the window
+    }
+
+    const mc = await host.logs({ file: 'agent', lines: 500, search: 'Micro-compaction' })
+    const mlines = (mc && (mc.lines || mc.data || mc.logs)) || []
+    const micro = collectMicroMarkers(mlines)
+
+    setCompact({
+      mode: running ? 'running' : 'idle',
+      startedAt: running ? (state.compact.startedAt || start) : null,
+      startTokens: running ? (state.compact.startTokens || startTokens) : null,
+      endedAt,
+      committed,
+      failure,
+      doneFrom,
+      doneTo,
+      lastMicroAt: micro.at,
+      microDetail: micro.detail,
+    })
+  } catch {
+    /* fail-open: keep last state on a REST blip */
+  }
+}
+
 function loadIntervals() {
   host.request('config.get', {})
     .then((cfg) => {
@@ -142,6 +295,7 @@ function ensureWired() {
   wiring = (function wire() {
     loadIntervals()
     reconcile()
+    reconcileCompaction()
     const offs = [
       host.onEvent('message.start', () => {
         if (state.mode !== 'running') set({ turnsSince: state.turnsSince + 1 })
@@ -159,7 +313,7 @@ function ensureWired() {
         })
       }),
     ]
-    const poll = setInterval(reconcile, POLL_MS)
+    const poll = setInterval(() => { reconcile(); reconcileCompaction() }, POLL_MS)
     return () => {
       clearInterval(poll)
       offs.forEach((off) => off && off())
@@ -275,6 +429,68 @@ function Chip() {
   })
 }
 
+// Compaction chip: visible only while a batch compaction is running or within
+// RECENT_COMP_MS of its end. Renders null otherwise (no idle noise).
+function CompactionChip() {
+  const s = useWatch()
+  const now = useNow()
+  const c = s.compact
+
+  const recentEnd = c.endedAt != null && now - c.endedAt < RECENT_COMP_MS
+  if (c.mode !== 'running' && !recentEnd) return null
+
+  let dotColor = 'var(--ui-accent)'
+  let label
+  let detail
+
+  if (c.mode === 'running') {
+    label = `compacting · ${ago(now - c.startedAt)}`
+    detail = `Batch context compaction in progress — the local model is summarizing the session middle (started at ~${fmtTokens(c.startTokens)} tokens).\n` +
+      'First measured run (197K-token session) committed in ~4 min. The single inference slot is busy until it commits, so queued messages will wait.\n' +
+      'Nothing is lost: a checkpoint is archived first, and the transcript stays searchable via session_search.'
+  } else if (c.committed === false) {
+    label = `compact failed ${ago(now - c.endedAt)} ago`
+    detail = `Compaction was aborted (${c.failure || 'unknown failure'}) — the session was left unchanged and will retry on the next compaction trigger.`
+  } else {
+    label = `compact done ${ago(now - c.endedAt)} ago`
+    detail = (c.doneFrom != null
+      ? `Compaction committed: ${c.doneFrom} → ${c.doneTo} messages.`
+      : 'Compaction committed.')
+  }
+  if (c.lastMicroAt != null && c.microDetail) {
+    detail += `\nLast micro-compact pass: ${ago(now - c.lastMicroAt)} ago (${c.microDetail})`
+  }
+
+  return jsxs(Tip, {
+    label: detail,
+    children: jsxs('span', {
+      style: {
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: '5px',
+        height: '100%',
+        padding: '0 6px',
+        fontSize: '0.6875rem',
+        color: dotColor,
+        whiteSpace: 'nowrap',
+      },
+      children: [
+        jsx('span', {
+          style: {
+            width: '6px',
+            height: '6px',
+            borderRadius: '50%',
+            background: dotColor,
+            display: 'inline-block',
+            animation: c.mode === 'running' ? 'bgrw-pulse 1.2s ease-in-out infinite' : 'none',
+          },
+        }),
+        jsx('span', { children: label }),
+      ],
+    }),
+  })
+}
+
 export default {
   id: 'bg-review-watch',
   name: 'Background Runner Watch',
@@ -287,6 +503,12 @@ export default {
       area: STATUSBAR_AREAS.right,
       order: 140,
       render: () => jsx(Chip, {}),
+    })
+    ctx.register({
+      id: 'chip-compact',
+      area: STATUSBAR_AREAS.right,
+      order: 141,
+      render: () => jsx(CompactionChip, {}),
     })
     // pulse keyframe (cosmetic; scoped to this plugin's lifetime)
     let styleEl = null

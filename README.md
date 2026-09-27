@@ -19,6 +19,7 @@ Status bar, right cluster:
 | Idle | `● review idle` + fill bar `Nt` — turns since last review / nudge interval (bar fills as the next nudge approaches) |
 | Running | `● review running · 2m 14s` (pulsing accent dot, live elapsed time) |
 | Just finished | `● review done 3s ago` — tooltip carries the summary text (e.g. "Skill 'x' created · …") |
+| **Compacting (v2)** | `● compacting · 4m 12s` (pulsing accent dot) while a batch context compaction runs; then `● compact done 3m ago` / `● compact failed 2m ago` for 10 min. Tooltip: committed reduction (`168 → 77 messages`) or failure class (`stall_interrupted`, `explicit_interrupt`, …), plus the last micro-compact pass when Stage A runs. Hidden entirely otherwise. |
 
 Hover for details: last result, next-nudge countdown for both memory
 (default 10 turns) and skill (default 15 turns) nudges.
@@ -68,6 +69,12 @@ no Python, no state written.
   (`agent/background_review.py`, `logs/agent.log`). If a Hermes build renames
   the `thread=bg-review` markers, the poll degrades to "idle" (fail-open) —
   the live `review.summary` path keeps working.
+- Compaction markers verified 2026-09-27 against
+  `agent/conversation_compression.py` (started/done/attempt-telemetry) and
+  `agent/turn_finalizer.py` (Micro-compaction), plus 13 historical telemetry
+  lines in `agent.log`. "Running" = latest `context compression started:`
+  newer than the latest terminal line (`done:` or telemetry JSON, which
+  covers both committed and aborted attempts).
 - The review replays the conversation on the main local model, so "running"
   also means the local model is busy — this plugin does not throttle the
   review; the harness knobs (`auxiliary.background_review.*`, nudge
