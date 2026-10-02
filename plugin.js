@@ -1,5 +1,5 @@
 // bg-review-watch — status chip + nudge countdown for Hermes background self-improvement runs,
-// plus a compaction chip that surfaces context compression (batch + micro) on the local model.
+// plus compaction and foreground-completion guards for local-model workloads.
 //
 // Disk plugin (loaded uncompiled): only @hermes/plugin-sdk / react / react/jsx-runtime resolve.
 //
@@ -15,6 +15,7 @@
 // Data sources (all read-only, no Python backend, no gateway restart):
 //   - host.onEvent('review.summary')        → live review completion + summary text
 //   - host.onEvent('message.start')         → turn ticks for the review countdown
+//   - host.onEvent('message.complete')      → foreground delivery boundary
 //   - host.logs({ file:'agent', search:… }) → markers, 20s poll:
 //       'bg-review'            → review start/complete markers
 //       'context compression'  → batch compaction started/done/attempt-telemetry markers
@@ -47,6 +48,7 @@ import { useSyncExternalStore, useState, useEffect } from 'react'
 const POLL_MS = 20000 // log poll cadence (idle cost is a few tiny server-side-filtered REST calls)
 const RECENT_DONE_MS = 600000 // keep the "done Xs ago" label for 10 min, then plain idle
 const RECENT_COMP_MS = 600000 // keep the compaction chip 10 min after a finish
+const RECENT_GUARD_MS = 600000 // keep completion-boundary diagnostics visible for 10 min
 
 const RE_START = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*OpenAI client created.*thread=bg-review:(\d+)/
 const RE_DONE = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*(Background review complete|Background memory\/skill review failed)(?:.*result=(\w+))?/
@@ -57,13 +59,18 @@ const RE_COMP_DONE = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*context compres
 const RE_COMP_TEL = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*context compression attempt telemetry: (.*)$/
 const RE_MICRO_OK = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*Micro-compaction: (\d+) -> (\d+) messages/
 const RE_MICRO_FAIL = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*Micro-compaction failed: (.+)/
+const RE_TICKER_TIMEOUT = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*usage ticker stop timed out: session=(\S+)/
 
 function lineText(l) {
   return typeof l === 'string' ? l : (l && (l.line || l.message || l.text)) || ''
 }
 function ts(s) {
-  const d = new Date(s.replace(' ', 'T')) // agent.log timestamps are local time
+  const d = new Date(s.replace(' ', 'T').replace(',', '.')) // agent.log timestamps are local time
   return isNaN(d) ? null : d.getTime()
+}
+function lineTs(text) {
+  const m = /^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)/.exec(text)
+  return m ? ts(m[1]) : null
 }
 function ago(ms) {
   if (ms == null) return '…'
@@ -90,6 +97,12 @@ let state = {
   memInterval: 10,
   skillInterval: 15,
   lastPoll: 0,
+  foregroundStartedAt: null,
+  foregroundCompletedAt: null,
+  reviewOverlapAt: null,
+  tickerRecoveryAt: null,
+  tickerRecoverySession: null,
+  guardLastPoll: 0,
   compact: {
     mode: 'idle', // 'idle' | 'running'
     startedAt: null,
@@ -121,13 +134,13 @@ function collectReviewMarkers(lines) {
   for (const text of lines.map(lineText)) {
     let m = RE_DONE.exec(text)
     if (m) {
-      const t = ts(m[1])
+      const t = lineTs(text) || ts(m[1])
       if (t && (done == null || t > done)) { done = t; result = m[3] != null ? m[3] : null }
       continue
     }
     m = RE_START.exec(text)
     if (m) {
-      const t = ts(m[1])
+      const t = lineTs(text) || ts(m[1])
       if (t && (start == null || t > start)) start = t
     }
   }
@@ -219,13 +232,37 @@ async function reconcile() {
     }
 
     const running = start != null && (done == null || start > done)
+    const overlap = start != null && state.foregroundStartedAt != null &&
+      start >= state.foregroundStartedAt &&
+      (state.foregroundCompletedAt == null || start < state.foregroundCompletedAt)
     set({
       mode: running ? 'running' : 'idle',
       startedAt: running ? (state.startedAt || start) : null,
       doneAt: done,
       doneResult: done != null && result != null ? result : state.doneResult,
       turnsSince: running ? 0 : turns,
+      reviewOverlapAt: overlap ? start : state.reviewOverlapAt,
     })
+  } catch {
+    /* fail-open: keep last state on a REST blip */
+  }
+}
+
+async function reconcileGuard() {
+  const now = Date.now()
+  if (now - state.guardLastPoll < 5000) return
+  state.guardLastPoll = now
+  try {
+    const result = await host.logs({ file: 'agent', lines: 100, search: 'usage ticker stop timed out' })
+    const lines = (result && (result.lines || result.data || result.logs)) || []
+    let at = null
+    let session = null
+    for (const text of lines.map(lineText)) {
+      const m = RE_TICKER_TIMEOUT.exec(text)
+      const t = m ? ts(m[1]) : null
+      if (t && (at == null || t > at)) { at = t; session = m[2] }
+    }
+    set({ tickerRecoveryAt: at, tickerRecoverySession: session })
   } catch {
     /* fail-open: keep last state on a REST blip */
   }
@@ -296,9 +333,17 @@ function ensureWired() {
     loadIntervals()
     reconcile()
     reconcileCompaction()
+    reconcileGuard()
     const offs = [
       host.onEvent('message.start', () => {
-        if (state.mode !== 'running') set({ turnsSince: state.turnsSince + 1 })
+        set({
+          foregroundStartedAt: Date.now(),
+          foregroundCompletedAt: null,
+          ...(state.mode !== 'running' ? { turnsSince: state.turnsSince + 1 } : {}),
+        })
+      }),
+      host.onEvent('message.complete', () => {
+        set({ foregroundCompletedAt: Date.now() })
       }),
       host.onEvent('review.summary', (ev) => {
         const text = (ev && (ev.text || (ev.data && ev.data.text))) || ''
@@ -313,13 +358,47 @@ function ensureWired() {
         })
       }),
     ]
-    const poll = setInterval(() => { reconcile(); reconcileCompaction() }, POLL_MS)
+    const poll = setInterval(() => { reconcile(); reconcileCompaction(); reconcileGuard() }, POLL_MS)
     return () => {
       clearInterval(poll)
       offs.forEach((off) => off && off())
       wiring = null
     }
   })()
+}
+
+// Hidden on healthy runs. A visible guard chip means either the bounded
+// foreground cleanup recovered a stalled ticker, or ordering regressed and a
+// review model started before the terminal foreground event.
+function GuardChip() {
+  const s = useWatch()
+  const now = useNow()
+  const overlapRecent = s.reviewOverlapAt != null && now - s.reviewOverlapAt < RECENT_GUARD_MS
+  const recoveryRecent = s.tickerRecoveryAt != null && now - s.tickerRecoveryAt < RECENT_GUARD_MS
+  if (!overlapRecent && !recoveryRecent) return null
+
+  const overlap = overlapRecent && (!recoveryRecent || s.reviewOverlapAt >= s.tickerRecoveryAt)
+  const color = overlap ? 'var(--ui-danger, #dc2626)' : 'var(--ui-warning, #d97706)'
+  const label = overlap
+    ? `review overlap · ${ago(now - s.reviewOverlapAt)} ago`
+    : `reply guard recovered · ${ago(now - s.tickerRecoveryAt)} ago`
+  const detail = overlap
+    ? 'A background review started before the foreground message.complete boundary. This violates the single-inference-slot ordering contract; inspect agent.log before sending another long turn.'
+    : `Foreground delivery continued after a usage ticker failed to stop within its bounded cleanup window${s.tickerRecoverySession ? ` (session ${s.tickerRecoverySession})` : ''}. The completed reply was preserved; inspect the logged ticker stack to diagnose the blocked sampler.`
+
+  return jsx(Tip, {
+    label: detail,
+    children: jsxs('span', {
+      style: {
+        display: 'inline-flex', alignItems: 'center', gap: '5px', height: '100%',
+        padding: '0 6px', fontSize: '0.6875rem', color, whiteSpace: 'nowrap',
+      },
+      children: [
+        jsx('span', { style: { width: '6px', height: '6px', borderRadius: '50%', background: color, display: 'inline-block' } }),
+        jsx('span', { children: label }),
+      ],
+    }),
+  })
 }
 
 function useWatch() {
@@ -493,7 +572,7 @@ function CompactionChip() {
 
 export default {
   id: 'bg-review-watch',
-  name: 'Background Runner Watch',
+  name: 'Background Review & Completion Watch',
   defaultEnabled: true,
   register(ctx) {
     ensureWired()
@@ -509,6 +588,12 @@ export default {
       area: STATUSBAR_AREAS.right,
       order: 141,
       render: () => jsx(CompactionChip, {}),
+    })
+    ctx.register({
+      id: 'chip-guard',
+      area: STATUSBAR_AREAS.right,
+      order: 142,
+      render: () => jsx(GuardChip, {}),
     })
     // pulse keyframe (cosmetic; scoped to this plugin's lifetime)
     let styleEl = null
